@@ -17,7 +17,7 @@ verified by a real `git push`).
 ## Run
 
 ```
-python3 -m unittest test_proxy -v   # 24 tests, local mock upstream only
+python3 -m unittest test_proxy -v   # 27 tests, local mock upstream only
 python3 proxy.py                    # serves on 127.0.0.1:8076 by default
 ```
 
@@ -49,6 +49,19 @@ python3 proxy.py                    # serves on 127.0.0.1:8076 by default
   retryable upstream failure and is never cached, never served, under any
   circumstance (`test_short_mismatched_206_is_never_cached_as_success`,
   including a restart-regression check that no range row survives it).
+  **For an open-ended request (`bytes=N-`, or no `Range` header at all)**,
+  there is no fixed requested end to check against, so instead a `206` is
+  only accepted once it provably reaches the true end of the file --
+  `Content-Range`'s own `total` is parsed (not discarded) and the response
+  is rejected unless its end equals `total - 1` and `total` is a real
+  number, not `*` (review 55786's showstopper: a short open-ended `206`
+  could otherwise be smuggled in as "the whole file")
+  (`test_open_ended_range_short_of_total_is_never_cached_as_success`,
+  `test_no_range_header_short_of_total_is_never_cached_as_success`,
+  `test_open_ended_range_that_reaches_total_is_accepted_and_cached` as the
+  positive control). A genuinely-complete open-ended fetch is cached and
+  warm-hit on the next request via `RangeCache.get_range_from`, which looks
+  up by start alone since there is no fixed end to key on.
 - `404` means "this file does not exist" (open-ocean squares have no file
   at all) and is cached as one durable, restart-persistent negative per
   file (`missing` table), never retried. **`403` is deliberately NOT

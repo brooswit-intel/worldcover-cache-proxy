@@ -189,6 +189,28 @@ class RangeCache:
             self._conn.commit()
         return row[0], row[1]
 
+    def get_range_from(self, path: str, start: int) -> tuple[int, str, bytes] | None:
+        """Looks up a cached range by its start alone, for an open-ended
+        request (no fixed end to key on). Returns (end, etag, body) for the
+        longest cached range starting there, or None on a miss. Safe because
+        an open-ended fetch is only ever cached (by fetch_upstream_range's
+        own validation) once it has provably reached the true end of the
+        file -- there is at most one genuine "whole remainder" entry per
+        start, never a shorter one masking it."""
+        with self._db_lock:
+            row = self._conn.execute(
+                "SELECT end, etag, body FROM ranges WHERE path = ? AND start = ? ORDER BY end DESC LIMIT 1",
+                (path, start),
+            ).fetchone()
+            if row is None:
+                return None
+            self._conn.execute(
+                "UPDATE ranges SET last_used_at = ? WHERE path = ? AND start = ? AND end = ?",
+                (time.time(), path, start, row[0]),
+            )
+            self._conn.commit()
+        return row[0], row[1], row[2]
+
     def put_range(self, path: str, start: int, end: int, body: bytes) -> str:
         etag = hashlib.sha256(body).hexdigest()
         now = time.time()
@@ -281,17 +303,22 @@ class UpstreamRangeNotSatisfiable(Exception):
 _CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+|\*)$")
 
 
-def _parse_content_range(header: str | None) -> tuple[int, int] | None:
+def _parse_content_range(header: str | None) -> tuple[int, int, int | None] | None:
     """Parses a response 'Content-Range: bytes <start>-<end>/<total>' header
-    into (start, end), or None if absent/malformed. A malformed or missing
+    into (start, end, total) -- total is None for an unknown '*' total --
+    or None if the header is absent/malformed. A malformed or missing
     Content-Range on a 206 is itself a reason to distrust the response --
-    see the validation in fetch_upstream_range."""
+    see the validation in fetch_upstream_range. The total is NOT discarded:
+    for an open-ended request (no explicit end), it is the only way to tell
+    a 206 that happens to reach the true end of the file from one that is
+    silently short (review 55786)."""
     if not header:
         return None
     m = _CONTENT_RANGE_RE.match(header.strip())
     if not m:
         return None
-    return int(m.group(1)), int(m.group(2))
+    total = None if m.group(3) == "*" else int(m.group(3))
+    return int(m.group(1)), int(m.group(2)), total
 
 
 def fetch_upstream_range(
@@ -381,17 +408,34 @@ def fetch_upstream_range(
                 if content_range is None:
                     last_exc = UpstreamError(f"206 with missing/malformed Content-Range for {full_path}")
                     continue
-                cr_start, cr_end = content_range
+                cr_start, cr_end, cr_total = content_range
                 if cr_start != start or len(body) != cr_end - cr_start + 1:
                     last_exc = UpstreamError(
                         f"206 Content-Range {cr_start}-{cr_end} does not match body length {len(body)} for {full_path}"
                     )
                     continue
-                if end is not None and cr_end != end:
-                    last_exc = UpstreamError(
-                        f"206 for {full_path} returned bytes {cr_start}-{cr_end}, requested {start}-{end}"
-                    )
-                    continue
+                if end is not None:
+                    if cr_end != end:
+                        last_exc = UpstreamError(
+                            f"206 for {full_path} returned bytes {cr_start}-{cr_end}, requested {start}-{end}"
+                        )
+                        continue
+                else:
+                    # Open-ended request (client sent 'bytes=N-' or no Range
+                    # at all, per serve_file mapping both to end=None): a
+                    # 206 is only complete, cacheable data if it provably
+                    # reaches the true end of the representation -- an
+                    # unknown '*' total, or any cr_end short of total - 1,
+                    # means this could be a silently-truncated partial body
+                    # (review 55786's exact repro) and must be retried, never
+                    # accepted as the whole file.
+                    if cr_total is None or cr_end != cr_total - 1:
+                        last_exc = UpstreamError(
+                            f"open-ended 206 for {full_path} returned bytes {cr_start}-{cr_end}/"
+                            f"{cr_total if cr_total is not None else '*'}, "
+                            "which does not provably reach the end of the file"
+                        )
+                        continue
             if status == 200 and end is not None:
                 length = end - start + 1
                 if start != 0 or len(body) > length:
@@ -521,8 +565,19 @@ class WorldCoverCacheProxy:
 
         cache_key_end = req_end if req_end is not None else -1  # resolved below on a miss
         cached = None
+        cached_end = req_end
         if req_end is not None:
             cached = self.cache.get_range(file_name, req_start, req_end)
+        else:
+            # Open-ended request: no fixed end to key on, so look up the
+            # longest cached range starting here instead of always treating
+            # it as a miss (a prior open-ended fetch is only ever cached
+            # once fetch_upstream_range has proven it reaches the true end
+            # of the file -- see get_range_from's own docstring).
+            hit = self.cache.get_range_from(file_name, req_start)
+            if hit is not None:
+                cached_end, etag_hit, body_hit = hit
+                cached = (etag_hit, body_hit)
 
         if cached is None:
             def load():
@@ -555,7 +610,7 @@ class WorldCoverCacheProxy:
             with self.stats.lock:
                 self.stats.cache_hits += 1
             etag, body = cached
-            actual_end = req_end
+            actual_end = cached_end
 
         if if_none_match is not None and if_none_match == etag:
             with self.stats.lock:

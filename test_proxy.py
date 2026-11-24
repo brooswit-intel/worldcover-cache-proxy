@@ -94,6 +94,30 @@ class MockUpstream(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(HEADER_BYTES[:100])
             return
+        if path == "ESA_WorldCover_10m_2021_v200_S03E173_Map.tif":
+            # Review 55786's exact repro: an open-ended request ('bytes=0-'
+            # or no Range header at all -- serve_file maps both to
+            # start=0/end=None) answered with a 206 that is short of the
+            # Content-Range's own declared total. Must never be accepted as
+            # "the whole file".
+            self.send_response(206)
+            self.send_header("Content-Length", "100")
+            self.send_header("Content-Range", "bytes 0-99/1000")
+            self.end_headers()
+            self.wfile.write(HEADER_BYTES[:100])
+            return
+        if path == "ESA_WorldCover_10m_2021_v200_S04E174_Map.tif":
+            # Positive control: an open-ended 206 that DOES provably reach
+            # the end of the representation (cr_end == total - 1) must still
+            # be accepted and cached -- the fix must not reject every
+            # open-ended response, only genuinely incomplete ones.
+            full = HEADER_BYTES + BLOCK_BYTES  # 700 bytes total
+            self.send_response(206)
+            self.send_header("Content-Length", str(len(full)))
+            self.send_header("Content-Range", f"bytes 0-{len(full) - 1}/{len(full)}")
+            self.end_headers()
+            self.wfile.write(full)
+            return
         if path == DEFAULT_HEALTH_FILE:
             # The health probe only cares that *some* HTTP response came back.
             self.send_response(206)
@@ -313,6 +337,58 @@ class ProxyIntegrationTest(unittest.TestCase):
         self.assertEqual(status2, 502)
         self.assertEqual(MockUpstream.hit_count["n"], 6, "a fresh request after restart must still hit upstream")
         proxy2.close()
+
+    def test_open_ended_range_short_of_total_is_never_cached_as_success(self):
+        """Review 55786's showstopper: 'bytes=0-' (open-ended) must not accept
+        a 206 that is short of the Content-Range's own declared total -- the
+        bounded-request fix alone does not cover this, since there is no
+        requested `end` to compare against."""
+        file_name = "ESA_WorldCover_10m_2021_v200_S03E173_Map.tif"
+        proxy = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)
+        status, _, _ = proxy.serve_file(f"/{file_name}", None, "bytes=0-")
+        self.assertEqual(status, 502, "a 206 short of the declared total must never be accepted as complete")
+        self.assertEqual(MockUpstream.hit_count["n"], 3)
+        self.assertIsNone(proxy.cache.get_range(file_name, 0, 99), "must never be cached under any extent")
+        proxy.close()
+
+        # Restart-regression proof.
+        proxy2 = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)
+        self.assertIsNone(proxy2.cache.get_range(file_name, 0, 99))
+        status2, _, _ = proxy2.serve_file(f"/{file_name}", None, "bytes=0-")
+        self.assertEqual(status2, 502)
+        self.assertEqual(MockUpstream.hit_count["n"], 6, "restart must not serve a smuggled-in partial body")
+        proxy2.close()
+
+    def test_no_range_header_short_of_total_is_never_cached_as_success(self):
+        """Same showstopper, via the plain-GET-no-Range path -- serve_file
+        maps a missing Range header to the same open-ended start=0/end=None,
+        so it must get the identical protection."""
+        file_name = "ESA_WorldCover_10m_2021_v200_S03E173_Map.tif"
+        proxy = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)
+        status, _, _ = proxy.serve_file(f"/{file_name}", None, None)
+        self.assertEqual(status, 502)
+        self.assertIsNone(proxy.cache.get_range(file_name, 0, 99))
+        proxy.close()
+
+    def test_open_ended_range_that_reaches_total_is_accepted_and_cached(self):
+        """Positive control: the fix must not reject every open-ended
+        response -- one that provably reaches the end of the representation
+        (cr_end == total - 1) is genuinely complete and must still be
+        accepted and cached normally."""
+        file_name = "ESA_WorldCover_10m_2021_v200_S04E174_Map.tif"
+        full = HEADER_BYTES + BLOCK_BYTES
+        proxy = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)
+        status, _, body = proxy.serve_file(f"/{file_name}", None, "bytes=0-")
+        self.assertEqual(status, 206)
+        self.assertEqual(body, full)
+        self.assertIsNotNone(proxy.cache.get_range(file_name, 0, len(full) - 1))
+
+        hits_before = MockUpstream.hit_count["n"]
+        status2, _, body2 = proxy.serve_file(f"/{file_name}", None, "bytes=0-")
+        self.assertEqual(status2, 206)
+        self.assertEqual(body2, full)
+        self.assertEqual(MockUpstream.hit_count["n"], hits_before, "a genuinely complete open-ended response must warm-cache normally")
+        proxy.close()
 
     def test_conditional_304_on_matching_etag(self):
         proxy = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)
