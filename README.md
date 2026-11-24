@@ -10,16 +10,14 @@ Endpoint inventory below was read from that exact tag, not `main`.
 
 ## Status
 
-Target repository `brooswit-intel/worldcover-cache-proxy` does not exist yet
-(confirmed with `gh repo view`: GraphQL "Could not resolve to a Repository").
-Per MINECRAFT-576 comment 55722 / MINECRAFT-571 comment 55722, Tayne owns
-creating it and granting `booswrit` repo-only Write. This tree is ready to
-push verbatim once that lands; work continues locally in the meantime.
+Pushed to `main` after Tayne's repo-only Write grant (MINECRAFT-571 comment
+55743, accepted invitation 346070236, `gh api .../permissions` push:true,
+verified by a real `git push`).
 
 ## Run
 
 ```
-python3 -m unittest test_proxy -v   # 16 tests, local mock upstream only
+python3 -m unittest test_proxy -v   # 22 tests, local mock upstream only
 python3 proxy.py                    # serves on 127.0.0.1:8076 by default
 ```
 
@@ -62,6 +60,24 @@ python3 proxy.py                    # serves on 127.0.0.1:8076 by default
 - `X-Attribution` response header carries `WorldCoverSource.ATTRIBUTION`
   verbatim (ESA WorldCover consortium, CC BY 4.0) on every successful
   response.
+- Cache lifetime is TTL -1 (no time-based expiration) for a successful,
+  validated range, per the shared Story's cross-lane decision (comments
+  55734/55737/55740 on MINECRAFT-571, naming WorldCover explicitly) --
+  proven surviving a one-year clock advance with zero re-fetch. "No time
+  limit" is not immutability: byte-budget LRU eviction still applies, and
+  `invalidate()` / an HTTP `DELETE <file>` give an explicit, out-of-band
+  clear of one file's cached ranges and negative marker (e.g. for a
+  dataset-version bump).
+- `/__health` is a separate, dedicated, TTL-0 endpoint per the same Story
+  decision: it never reads or writes either cache table and always issues
+  one bounded, unretried, minimal-Range probe straight to the fixed
+  upstream, so it answers "is the upstream reachable" distinctly from
+  "does this process respond" (`/__stats`) and from "is this file cached"
+  (the ordinary path, which keeps serving warm during an upstream outage).
+  Proven side by side: a warm tile keeps serving from SQLite with zero
+  upstream calls while the upstream is down, and `/__health` truthfully
+  flips to unreachable at the same time, then recovers once upstream is
+  back.
 
 ## What this is not (yet)
 

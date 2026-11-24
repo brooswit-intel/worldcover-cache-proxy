@@ -29,6 +29,27 @@ override with unchanged defaults" the ticket asks for, scoped to this
 proxy's own egress. No live request against the real bucket is made by this
 module or its tests -- per the ticket, no live-provider use before terms
 verification.
+
+Cache lifetime, per the shared Story's cross-lane decision (comments 55734,
+55737, 55740 on MINECRAFT-571, explicitly naming WorldCover): a successful,
+validated range is cached at TTL -1 (no time-based expiration) -- this was
+already this module's behavior, since RangeCache never expires an entry by
+age -- but "no time limit" is not "unbounded or immutable": byte-budget
+eviction (below) still applies, and `invalidate_file`/the HTTP DELETE verb
+give an explicit, out-of-band way to clear a file's cached ranges and
+missing marker (e.g. on a dataset version bump). Failures, 403/429-style
+authorization/rate-limit responses, truncated transfers, and an unverified
+absence are never written to the permanent (TTL -1) cache; only a
+confirmed-missing file (403/404) is -- as its own bounded negative, not the
+general failure path.
+
+Separately, `/__health` is its own dedicated, TTL-0 endpoint: it never
+reads or writes either cache table, and performs one bounded, unretried,
+minimal Range probe directly against the fixed upstream, so a cached tile
+can keep serving warm/offline while this endpoint still reports upstream
+reachability truthfully. It answers "is the upstream reachable", not "is
+this process alive" (which `/__stats` already answers merely by
+responding) -- the two are deliberately kept distinct.
 """
 from __future__ import annotations
 
@@ -44,6 +65,12 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DEFAULT_UPSTREAM = "https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/map/"
+# A representative, real square (Lagos/Niger Delta, West Africa) used only to
+# probe upstream reachability in /__health. Any HTTP response -- including a
+# 403/404 for this exact file -- still proves the upstream host answers;
+# override via WORLDCOVER_CACHE_HEALTH_FILE if a deployment wants a different
+# probe target.
+DEFAULT_HEALTH_FILE = "ESA_WorldCover_10m_2021_v200_N06E003_Map.tif"
 ATTRIBUTION = (
     "ESA WorldCover project 2021 / Contains modified Copernicus Sentinel data (2021) "
     "processed by ESA WorldCover consortium (CC BY 4.0)"
@@ -182,6 +209,21 @@ class RangeCache:
             )
             self._conn.commit()
 
+    def invalidate_file(self, path: str) -> int:
+        """Explicit, out-of-band clear of everything cached for one file --
+        every cached range and any negative ('missing') marker. TTL -1 means
+        no time-based expiry, not immutability; this is the escape hatch for
+        a dataset revision or a confirmed-stale entry. Returns the number of
+        range rows removed."""
+        with self._db_lock:
+            removed = self._conn.execute(
+                "SELECT COUNT(*) FROM ranges WHERE path = ?", (path,)
+            ).fetchone()[0]
+            self._conn.execute("DELETE FROM ranges WHERE path = ?", (path,))
+            self._conn.execute("DELETE FROM missing WHERE path = ?", (path,))
+            self._conn.commit()
+        return removed
+
     def total_bytes(self) -> int:
         with self._db_lock:
             row = self._conn.execute("SELECT COALESCE(SUM(size), 0) FROM ranges").fetchone()
@@ -295,6 +337,33 @@ def fetch_upstream_range(
     raise UpstreamError(f"upstream fetch failed after {retries} attempts: {last_exc}")
 
 
+def probe_upstream_reachable(upstream_base: str, health_file: str, timeout: float = 3.0) -> bool:
+    """Bounded, single-attempt (no retry, no cache read/write) reachability
+    probe for the dedicated /__health endpoint: a minimal Range request
+    (bytes=0-0) against a representative file. ANY HTTP response -- 200,
+    206, 403, 404, even a 5xx -- proves the upstream host answered, so only
+    a genuine network-level failure (connection refused, timeout, DNS) is
+    reported as unreachable. This must never be confused with "is the file
+    present" (that is what the ordinary cached path answers) or "is this
+    process alive" (/__stats answers that merely by responding)."""
+    parsed = urllib.parse.urlsplit(upstream_base)
+    full_path = parsed.path.rstrip("/") + "/" + health_file
+    conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    conn = conn_cls(parsed.netloc, timeout=timeout)
+    try:
+        conn.request(
+            "GET",
+            full_path,
+            headers={"User-Agent": "earth-platform/earth-worldcover-io", "Range": "bytes=0-0"},
+        )
+        conn.getresponse().read()
+        return True
+    except OSError:
+        return False
+    finally:
+        conn.close()
+
+
 class _Flight(threading.Event):
     """An Event that also carries its own leader's result, so every waiter
     reads its own reference instead of racing the others over a shared dict."""
@@ -333,11 +402,32 @@ class _SingleFlight:
 
 
 class WorldCoverCacheProxy:
-    def __init__(self, db_path: str, upstream_base: str | None = None, max_bytes: int = 256 * 1024 * 1024):
+    def __init__(
+        self,
+        db_path: str,
+        upstream_base: str | None = None,
+        max_bytes: int = 256 * 1024 * 1024,
+        health_file: str | None = None,
+    ):
         self.upstream_base = upstream_base or os.environ.get("WORLDCOVER_CACHE_UPSTREAM", DEFAULT_UPSTREAM)
+        self.health_file = health_file or os.environ.get("WORLDCOVER_CACHE_HEALTH_FILE", DEFAULT_HEALTH_FILE)
         self.cache = RangeCache(db_path, max_bytes)
         self.stats = Stats()
         self._single_flight = _SingleFlight()
+
+    def check_health(self) -> bool:
+        """The dedicated TTL-0 upstream-reachability check: never touches
+        either cache table, always issues a fresh bounded probe."""
+        return probe_upstream_reachable(self.upstream_base, self.health_file)
+
+    def invalidate(self, request_path: str) -> int | None:
+        """Explicit out-of-band cache clear for one file (TTL -1 means no
+        time-based expiry, not immutability). Returns the rows removed, or
+        None if the path doesn't name a valid WorldCover file."""
+        file_name = _parse_file_path(request_path)
+        if file_name is None:
+            return None
+        return self.cache.invalidate_file(file_name)
 
     def serve_file(self, request_path: str, if_none_match: str | None, range_header: str | None):
         """Returns (status, headers_dict, body_bytes) for one client request."""
@@ -415,15 +505,27 @@ def make_handler(proxy: WorldCoverCacheProxy):
         def log_message(self, fmt, *args):  # quiet; stats endpoint covers verification
             pass
 
+        def _send_json(self, status: int, obj: dict):
+            import json
+            payload = json.dumps(obj).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
         def do_GET(self):
             if self.path == "/__stats":
-                import json
-                payload = json.dumps(proxy.stats.as_dict()).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
+                self._send_json(200, proxy.stats.as_dict())
+                return
+
+            if self.path == "/__health":
+                # TTL 0: never reads/writes the tile/data cache, always a fresh probe.
+                reachable = proxy.check_health()
+                self._send_json(
+                    200 if reachable else 503,
+                    {"upstream_reachable": reachable, "upstream": proxy.upstream_base},
+                )
                 return
 
             status, headers, body = proxy.serve_file(
@@ -438,6 +540,15 @@ def make_handler(proxy: WorldCoverCacheProxy):
             self.end_headers()
             if body:
                 self.wfile.write(body)
+
+        def do_DELETE(self):
+            # Explicit, out-of-band invalidation of one file's cached ranges
+            # and negative marker -- the escape hatch TTL -1 still needs.
+            removed = proxy.invalidate(self.path)
+            if removed is None:
+                self._send_json(404, {"invalidated": False})
+            else:
+                self._send_json(200, {"invalidated": True, "ranges_removed": removed})
 
     return Handler
 

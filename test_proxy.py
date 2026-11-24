@@ -12,10 +12,11 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from proxy import WorldCoverCacheProxy, run_server, ATTRIBUTION
+from proxy import WorldCoverCacheProxy, run_server, ATTRIBUTION, DEFAULT_HEALTH_FILE
 
 EXISTING_FILE = "ESA_WorldCover_10m_2021_v200_N09W042_Map.tif"
 OCEAN_FILE_404 = "ESA_WorldCover_10m_2021_v200_N00W170_Map.tif"
@@ -60,6 +61,14 @@ class MockUpstream(BaseHTTPRequestHandler):
             # may not list -- the mod treats this identically to a missing file.
             self.send_response(403)
             self.end_headers()
+            return
+        if path == DEFAULT_HEALTH_FILE:
+            # The health probe only cares that *some* HTTP response came back.
+            self.send_response(206)
+            self.send_header("Content-Length", "1")
+            self.send_header("Content-Range", "bytes 0-0/999999")
+            self.end_headers()
+            self.wfile.write(b"x")
             return
         if path != EXISTING_FILE:
             self.send_response(404)
@@ -320,6 +329,103 @@ class ProxyIntegrationTest(unittest.TestCase):
             server.shutdown()
             server.server_close()
             proxy.close()
+
+
+    def test_health_endpoint_reports_reachable_when_upstream_up(self):
+        proxy = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)
+        self.assertTrue(proxy.check_health())
+        proxy.close()
+
+    def test_health_check_never_touches_either_cache_table(self):
+        proxy = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)
+        before = proxy.cache.total_bytes()
+        proxy.check_health()
+        proxy.check_health()
+        self.assertEqual(proxy.cache.total_bytes(), before)
+        self.assertFalse(proxy.cache.is_missing(DEFAULT_HEALTH_FILE))
+        proxy.close()
+
+    def test_health_endpoint_is_distinct_from_the_warm_tile_cache_during_an_outage(self):
+        """Core proof from Story comments 55734/55737: a warm tile keeps serving
+        from SQLite while the upstream is down, but the dedicated health endpoint
+        -- which never reads the cache -- truthfully reports that same outage.
+        Restoring the upstream must make a fresh probe succeed again."""
+        proxy = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)
+        status, _, body = proxy.serve_file(f"/{EXISTING_FILE}", None, "bytes=0-199")
+        self.assertEqual(status, 206)
+        self.assertEqual(body, HEADER_BYTES)
+        self.assertTrue(proxy.check_health(), "upstream is up before the outage")
+
+        # Take the mock upstream down entirely (socket closed, not just stopped).
+        self.mock.shutdown()
+        self.mock.server_close()
+
+        # The already-cached tile must still serve with zero upstream calls.
+        hits_before_outage = MockUpstream.hit_count["n"]
+        status2, _, body2 = proxy.serve_file(f"/{EXISTING_FILE}", None, "bytes=0-199")
+        self.assertEqual(status2, 206)
+        self.assertEqual(body2, HEADER_BYTES)
+        self.assertEqual(MockUpstream.hit_count["n"], hits_before_outage, "warm tile must not call the (now-dead) upstream")
+
+        # The dedicated health endpoint must truthfully report the outage.
+        self.assertFalse(proxy.check_health(), "health check must detect the real outage")
+
+        # Bring the upstream back up on the SAME port and confirm recovery.
+        self.mock = HTTPServer(("127.0.0.1", self.mock_port), MockUpstream)
+        self.mock_thread = threading.Thread(target=self.mock.serve_forever, daemon=True)
+        self.mock_thread.start()
+        self.assertTrue(proxy.check_health(), "a fresh probe must succeed once upstream is back")
+        proxy.close()
+
+    def test_explicit_invalidation_clears_cached_range_and_negative_marker(self):
+        """TTL -1 (no time-based expiry) is not immutability: invalidate() /
+        the DELETE verb is the explicit escape hatch the Story asks for."""
+        proxy = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)
+        proxy.serve_file(f"/{EXISTING_FILE}", None, "bytes=0-199")
+        self.assertIsNotNone(proxy.cache.get_range(EXISTING_FILE, 0, 199))
+
+        proxy.serve_file(f"/{OCEAN_FILE_404}", None, "bytes=0-199")
+        self.assertTrue(proxy.cache.is_missing(OCEAN_FILE_404))
+
+        removed = proxy.invalidate(f"/{EXISTING_FILE}")
+        self.assertEqual(removed, 1)
+        self.assertIsNone(proxy.cache.get_range(EXISTING_FILE, 0, 199))
+
+        removed2 = proxy.invalidate(f"/{OCEAN_FILE_404}")
+        self.assertEqual(removed2, 0, "no range rows for a missing file, but the marker must still clear")
+        self.assertFalse(proxy.cache.is_missing(OCEAN_FILE_404))
+
+        # A re-request after invalidation must go back to the upstream.
+        hits_before = MockUpstream.hit_count["n"]
+        proxy.serve_file(f"/{EXISTING_FILE}", None, "bytes=0-199")
+        self.assertEqual(MockUpstream.hit_count["n"], hits_before + 1)
+        proxy.close()
+
+    def test_invalidate_rejects_an_invalid_path(self):
+        proxy = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)
+        self.assertIsNone(proxy.invalidate("/../../etc/passwd"))
+        proxy.close()
+
+    def test_ttl_minus_one_survives_a_large_clock_advance_with_zero_upstream_calls(self):
+        """'No time-based expiration' proven directly: backdating a cached
+        range's timestamps by a year must not cause it to expire or be
+        re-fetched -- distinct from the byte-budget eviction tested elsewhere,
+        which is size-based, not age-based."""
+        proxy = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)
+        proxy.serve_file(f"/{EXISTING_FILE}", None, "bytes=0-199")
+        ancient = time.time() - 365 * 24 * 3600
+        proxy.cache._conn.execute(
+            "UPDATE ranges SET created_at = ?, last_used_at = ? WHERE path = ?",
+            (ancient, ancient, EXISTING_FILE),
+        )
+        proxy.cache._conn.commit()
+
+        hits_before = MockUpstream.hit_count["n"]
+        status, _, body = proxy.serve_file(f"/{EXISTING_FILE}", None, "bytes=0-199")
+        self.assertEqual(status, 206)
+        self.assertEqual(body, HEADER_BYTES)
+        self.assertEqual(MockUpstream.hit_count["n"], hits_before, "a year-old entry must not expire or be re-fetched")
+        proxy.close()
 
 
 if __name__ == "__main__":
