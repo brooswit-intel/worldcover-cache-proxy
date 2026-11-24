@@ -17,7 +17,7 @@ verified by a real `git push`).
 ## Run
 
 ```
-python3 -m unittest test_proxy -v   # 22 tests, local mock upstream only
+python3 -m unittest test_proxy -v   # 23 tests, local mock upstream only
 python3 proxy.py                    # serves on 127.0.0.1:8076 by default
 ```
 
@@ -42,13 +42,20 @@ python3 proxy.py                    # serves on 127.0.0.1:8076 by default
   requested slice itself, for an origin that ignores Range); the proxy
   always answers the client `206` with the corresponding `Content-Range`
   for a Range request.
-- `403` and `404` both mean "this file does not exist" (open-ocean squares
-  have no file at all) -- `RangeFiles.transfer`: `if (status == 404 ||
-  status == 403) return null;`. Both are cached as one durable,
-  restart-persistent negative per file (`missing` table), never retried,
-  and distinguished sharply from a transient failure (`test_403_is_treated_
-  identically_to_404_not_as_a_transient_failure`,
-  `test_transient_failure_is_distinguished_from_missing_and_never_cached`).
+- `404` means "this file does not exist" (open-ocean squares have no file
+  at all) and is cached as one durable, restart-persistent negative per
+  file (`missing` table), never retried. **`403` is deliberately NOT
+  treated the same way**, unlike the mod's own `RangeFiles.transfer()`
+  (`if (status == 404 || status == 403) return null;`): per Story review
+  checkpoint 55758 on MINECRAFT-571, a 403 from this anonymous, unsigned S3
+  bucket cannot be positively distinguished here from an auth/provider
+  failure (a bucket-policy change, a WAF rule, throttling dressed as 403),
+  so it falls through to the generic retry-then-fail path exactly like a
+  5xx and is NEVER cached in either table (`test_persistent_403_is_never_
+  cached_as_a_durable_negative`, which also proves no negative marker
+  survives a restart; `test_transient_403_is_retried_and_can_still_
+  succeed`, `test_transient_failure_is_distinguished_from_missing_and_
+  never_cached`).
 - A transient upstream failure (5xx, connection error) is retried 3x with
   backoff and never cached in either table. `416` from upstream is passed
   straight through to the client and never cached either.
@@ -83,7 +90,7 @@ python3 proxy.py                    # serves on 127.0.0.1:8076 by default
 
 - Not tested against the live S3 bucket: per the ticket's no-live-quota
   instruction pending terms review, all tests run against a local mock
-  upstream serving the identical Range / 403-or-404-is-missing contract.
+  upstream serving the identical Range / 404-only-is-missing contract.
 - No mod-side wiring change yet (an `earthplatform.earth.worldcoverBase`-style
   override point analogous to elevation's `terrariumBase()`, pointed at
   `127.0.0.1:8076`) -- blocked on the same repo-access grant.

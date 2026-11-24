@@ -2,11 +2,12 @@
 
 Runs against a local mock upstream (never the live ESA WorldCover S3
 bucket): per the ticket and coordination comments, no live provider/quota
-use is authorized until terms are reviewed. The mock serves the exact
-Range-request / 403-or-404-is-missing contract inventoried from
-WorldCoverSource.java + RangeFiles.java at combined-73, so the cache
-mechanics under test are the real ones the proxy will use against the live
-default.
+use is authorized until terms are reviewed. The mock serves the Range-
+request contract inventoried from WorldCoverSource.java + RangeFiles.java
+at combined-73, plus the narrower 404-only-is-missing contract this proxy
+deliberately substitutes for the mod's own 403-or-404 rule (Story review
+checkpoint 55758 on MINECRAFT-571), so the cache mechanics under test are
+the real ones the proxy will use against the live default.
 """
 import os
 import shutil
@@ -32,6 +33,7 @@ BLOCK_START = 65536
 class MockUpstream(BaseHTTPRequestHandler):
     hit_count = {"n": 0}
     fail_next = {"n": 0}
+    fail_403_next = {"n": 0}
 
     def log_message(self, fmt, *args):
         pass
@@ -57,10 +59,29 @@ class MockUpstream(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if path == OCEAN_FILE_403:
-            # S3 answers 403 (not 404) for a key an unsigned/anonymous request
-            # may not list -- the mod treats this identically to a missing file.
+            # S3 answers 403 for this key. This proxy does NOT treat that as
+            # confirmed absence (Story review checkpoint 55758) -- it is
+            # ambiguous with an auth/provider failure, so the mock keeps
+            # answering 403 on every attempt, forever, to prove the proxy
+            # never gives up and writes a durable negative for it.
             self.send_response(403)
             self.end_headers()
+            return
+        if path == "ESA_WorldCover_10m_2021_v200_S01E171_Map.tif":
+            # A *transient* 403 (e.g. a brief throttling/WAF blip) that
+            # clears on retry -- proves 403 is retried like a 5xx, not
+            # immediately surfaced as a terminal "missing" verdict.
+            if MockUpstream.fail_403_next["n"] > 0:
+                MockUpstream.fail_403_next["n"] -= 1
+                self.send_response(403)
+                self.end_headers()
+                return
+            start, end = self._range() or (0, None)
+            self.send_response(206)
+            self.send_header("Content-Length", str(len(HEADER_BYTES)))
+            self.send_header("Content-Range", f"bytes {start}-{start + len(HEADER_BYTES) - 1}/999999")
+            self.end_headers()
+            self.wfile.write(HEADER_BYTES)
             return
         if path == DEFAULT_HEALTH_FILE:
             # The health probe only cares that *some* HTTP response came back.
@@ -101,6 +122,7 @@ class ProxyIntegrationTest(unittest.TestCase):
     def setUp(self):
         MockUpstream.hit_count["n"] = 0
         MockUpstream.fail_next["n"] = 0
+        MockUpstream.fail_403_next["n"] = 0
         self.mock = HTTPServer(("127.0.0.1", 0), MockUpstream)
         self.mock_port = self.mock.server_address[1]
         self.mock_thread = threading.Thread(target=self.mock.serve_forever, daemon=True)
@@ -189,19 +211,43 @@ class ProxyIntegrationTest(unittest.TestCase):
         self.assertEqual(MockUpstream.hit_count["n"], 1, "restart must not re-fetch a known-missing file")
         proxy2.close()
 
-    def test_403_is_treated_identically_to_404_not_as_a_transient_failure(self):
-        """Matches RangeFiles.transfer(): `if (status == 404 || status == 403) return null;`
-        -- a 403 for a file that genuinely doesn't exist on this anonymous bucket must be
-        cached as a durable negative exactly like a 404, never retried, never treated as
-        the kind of failure that could later succeed."""
+    def test_persistent_403_is_never_cached_as_a_durable_negative(self):
+        """Story review checkpoint 55758: unlike the mod's own RangeFiles.transfer()
+        (`if (status == 404 || status == 403) return null;`), this proxy must NOT
+        treat a 403 from this anonymous bucket as positively-confirmed absence --
+        it cannot be told apart here from an auth/provider failure. A persistent
+        403 must retry (like a 5xx), fail with 502, and leave no negative marker,
+        so a transient permissions/WAF issue can never permanently blacklist a
+        real file."""
         proxy = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)
         status, _, _ = proxy.serve_file(f"/{OCEAN_FILE_403}", None, "bytes=0-199")
-        self.assertEqual(status, 404, "403 surfaces to the client the same way 404 does")
-        self.assertEqual(MockUpstream.hit_count["n"], 1, "403 must not be retried")
+        self.assertEqual(status, 502, "403 is a failure, not a confirmed-missing verdict")
+        self.assertEqual(MockUpstream.hit_count["n"], 3, "403 must be retried exactly like a 5xx")
+        self.assertFalse(proxy.cache.is_missing(OCEAN_FILE_403), "403 must never write a durable negative")
+        proxy.close()
 
-        status2, _, _ = proxy.serve_file(f"/{OCEAN_FILE_403}", None, "bytes=0-199")
-        self.assertEqual(status2, 404)
-        self.assertEqual(MockUpstream.hit_count["n"], 1, "must be served from the negative cache")
+        # Restart-regression proof (the exact failure mode the reviewer flagged):
+        # a fresh process reopening the same SQLite file must find no lingering
+        # negative for this file either -- no ".none"-equivalent marker persisted.
+        proxy2 = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)
+        self.assertFalse(proxy2.cache.is_missing(OCEAN_FILE_403), "no durable negative must survive a restart for a 403")
+        status2, _, _ = proxy2.serve_file(f"/{OCEAN_FILE_403}", None, "bytes=0-199")
+        self.assertEqual(status2, 502)
+        self.assertEqual(MockUpstream.hit_count["n"], 6, "a fresh request after restart must still go to upstream, not a cached negative")
+        proxy2.close()
+
+    def test_transient_403_is_retried_and_can_still_succeed(self):
+        """A 403 is treated as retryable, not terminal: one that clears (a brief
+        throttling/WAF blip) must recover within the existing retry budget, the
+        same way a transient 503 does."""
+        MockUpstream.fail_403_next["n"] = 1
+        file_name = "ESA_WorldCover_10m_2021_v200_S01E171_Map.tif"
+        proxy = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)
+        status, _, body = proxy.serve_file(f"/{file_name}", None, "bytes=0-199")
+        self.assertEqual(status, 206, "retry must recover from one transient 403")
+        self.assertEqual(body, HEADER_BYTES)
+        self.assertEqual(MockUpstream.hit_count["n"], 2, "the failed 403 attempt plus the retry that succeeded")
+        self.assertFalse(proxy.cache.is_missing(file_name))
         proxy.close()
 
     def test_transient_failure_is_distinguished_from_missing_and_never_cached(self):

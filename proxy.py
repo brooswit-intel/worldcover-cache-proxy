@@ -14,13 +14,20 @@ RangeFiles.java -- not upstream main):
   on a short read, up to 1 MiB) and the data blocks it needs, via
   RangeFiles.transfer(). It accepts HTTP 200 or 206 as success -- trimming a
   200 body down to the requested slice itself, for an origin that ignores
-  Range -- and treats BOTH 403 and 404 as "file does not exist" (open-ocean
-  squares have no file at all): not an error, not retried, and the result
-  (Header.MISSING) is a legitimate, durable negative cached to a ".none"
-  marker file. Any other status (5xx, etc.) is retried 3x with backoff and
-  NEVER cached. Attribution (ESA WorldCover consortium, CC BY 4.0) must be
-  preserved; see ATTRIBUTION below, copied verbatim from
-  WorldCoverSource.ATTRIBUTION.
+  Range -- and the MOD treats BOTH 403 and 404 as "file does not exist"
+  (`if (status == 404 || status == 403) return null;`), caching that result
+  durably to a ".none" marker file. THIS PROXY DELIBERATELY DOES NOT COPY
+  that 403 half of the behavior (Story review checkpoint, MINECRAFT-571
+  comment 55758, naming WorldCover): a 403 from this anonymous, unsigned S3
+  bucket is not something this proxy can positively confirm is genuine
+  absence rather than an auth/provider failure (a bucket-policy change, a
+  WAF rule, throttling dressed as 403) without a live request, which is not
+  authorized before terms verification. So here, only 404 is a confirmed,
+  durable negative; 403 falls through to the generic retry-then-fail path,
+  exactly like a 5xx, and is NEVER cached. Any other status (5xx, etc.) is
+  likewise retried 3x with backoff and never cached. Attribution (ESA
+  WorldCover consortium, CC BY 4.0) must be preserved; see ATTRIBUTION
+  below, copied verbatim from WorldCoverSource.ATTRIBUTION.
 
 Default upstream is exactly the mod's existing default (no behavior change
 for a caller that never overrides it). WORLDCOVER_CACHE_UPSTREAM overrides
@@ -40,8 +47,8 @@ give an explicit, out-of-band way to clear a file's cached ranges and
 missing marker (e.g. on a dataset version bump). Failures, 403/429-style
 authorization/rate-limit responses, truncated transfers, and an unverified
 absence are never written to the permanent (TTL -1) cache; only a
-confirmed-missing file (403/404) is -- as its own bounded negative, not the
-general failure path.
+positively-confirmed-missing file (404 only, not 403 -- see above) is, as
+its own bounded negative, never the general failure path.
 
 Separately, `/__health` is its own dedicated, TTL-0 endpoint: it never
 reads or writes either cache table, and performs one bounded, unretried,
@@ -261,7 +268,10 @@ class UpstreamError(Exception):
 
 
 class UpstreamMissing(Exception):
-    """Upstream answered 403 or 404: the file genuinely does not exist."""
+    """Upstream answered 404: a positively-confirmed absence. Deliberately
+    NOT raised for 403 -- see the module docstring and Story review
+    checkpoint 55758: an anonymous-bucket 403 cannot be told apart from an
+    auth/provider failure here, so it is never treated as durable absence."""
 
 
 class UpstreamRangeNotSatisfiable(Exception):
@@ -276,16 +286,18 @@ def fetch_upstream_range(
     timeout: float = 10.0,
     retries: int = 3,
 ) -> tuple[bytes, int]:
-    """Fetches one byte range from the allowlisted upstream, matching
-    RangeFiles.transfer(): a fixed Range header is sent, 200 or 206 is
-    success (a 200 body is trimmed to the requested slice when a bounded end
-    was given and the origin ignored Range), 403/404 means the file does not
-    exist (raises UpstreamMissing, never retried), 416 is passed straight
-    through (raises UpstreamRangeNotSatisfiable, never retried, never
-    cached), and anything else is retried with backoff before giving up.
-    Returns (body, actual_end) -- actual_end is the real last byte index
-    covered, which can differ from the requested `end` for an open-ended
-    range.
+    """Fetches one byte range from the allowlisted upstream: a fixed Range
+    header is sent, 200 or 206 is success (a 200 body is trimmed to the
+    requested slice when a bounded end was given and the origin ignored
+    Range), 404 means positively-confirmed absence (raises UpstreamMissing,
+    never retried, cached as a durable negative by the caller), 416 is
+    passed straight through (raises UpstreamRangeNotSatisfiable, never
+    retried, never cached), and anything else -- including 403, which is
+    deliberately NOT treated as confirmed absence here (see UpstreamMissing's
+    docstring) -- is retried with backoff before giving up, and never cached
+    either way. Returns (body, actual_end) -- actual_end is the real last
+    byte index covered, which can differ from the requested `end` for an
+    open-ended range.
     """
     parsed = urllib.parse.urlsplit(upstream_base)
     full_path = parsed.path.rstrip("/") + "/" + file_name
@@ -308,7 +320,23 @@ def fetch_upstream_range(
             resp = conn.getresponse()
             body = resp.read()
             status = resp.status
-            if status in (403, 404):
+            if status == 404:
+                # Per Story review checkpoint 55758: only 404 is treated as
+                # positively-established absence. A 403 from this anonymous,
+                # unsigned S3 bucket is NOT distinguishable here from an
+                # auth/provider failure (a bucket-policy change, a WAF rule,
+                # a throttling response dressed as 403), so it must never
+                # become a durable negative -- it falls through to the
+                # generic retry-then-fail path below instead, exactly like
+                # a 5xx. (RangeFiles.transfer() in the pinned mod source
+                # treats 403 and 404 identically; that in-game behavior is
+                # still a correct description of what the MOD does, but
+                # this proxy cannot independently verify that this specific
+                # bucket's 403 is genuinely absence rather than a stale/
+                # misconfigured permission without a live request, which is
+                # not authorized before terms verification -- so until that
+                # is positively confirmed, the safer, explicitly-requested
+                # behavior is to not persist it.)
                 raise UpstreamMissing(f"HTTP {status} for {full_path}")
             if status == 416:
                 raise UpstreamRangeNotSatisfiable(f"HTTP 416 for {full_path} range {range_value}")
