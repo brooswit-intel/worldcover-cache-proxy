@@ -14,13 +14,20 @@ RangeFiles.java -- not upstream main):
   on a short read, up to 1 MiB) and the data blocks it needs, via
   RangeFiles.transfer(). It accepts HTTP 200 or 206 as success -- trimming a
   200 body down to the requested slice itself, for an origin that ignores
-  Range -- and treats BOTH 403 and 404 as "file does not exist" (open-ocean
-  squares have no file at all): not an error, not retried, and the result
-  (Header.MISSING) is a legitimate, durable negative cached to a ".none"
-  marker file. Any other status (5xx, etc.) is retried 3x with backoff and
-  NEVER cached. Attribution (ESA WorldCover consortium, CC BY 4.0) must be
-  preserved; see ATTRIBUTION below, copied verbatim from
-  WorldCoverSource.ATTRIBUTION.
+  Range -- and the MOD treats BOTH 403 and 404 as "file does not exist"
+  (`if (status == 404 || status == 403) return null;`), caching that result
+  durably to a ".none" marker file. THIS PROXY DELIBERATELY DOES NOT COPY
+  that 403 half of the behavior (Story review checkpoint, MINECRAFT-571
+  comment 55758, naming WorldCover): a 403 from this anonymous, unsigned S3
+  bucket is not something this proxy can positively confirm is genuine
+  absence rather than an auth/provider failure (a bucket-policy change, a
+  WAF rule, throttling dressed as 403) without a live request, which is not
+  authorized before terms verification. So here, only 404 is a confirmed,
+  durable negative; 403 falls through to the generic retry-then-fail path,
+  exactly like a 5xx, and is NEVER cached. Any other status (5xx, etc.) is
+  likewise retried 3x with backoff and never cached. Attribution (ESA
+  WorldCover consortium, CC BY 4.0) must be preserved; see ATTRIBUTION
+  below, copied verbatim from WorldCoverSource.ATTRIBUTION.
 
 Default upstream is exactly the mod's existing default (no behavior change
 for a caller that never overrides it). WORLDCOVER_CACHE_UPSTREAM overrides
@@ -40,8 +47,8 @@ give an explicit, out-of-band way to clear a file's cached ranges and
 missing marker (e.g. on a dataset version bump). Failures, 403/429-style
 authorization/rate-limit responses, truncated transfers, and an unverified
 absence are never written to the permanent (TTL -1) cache; only a
-confirmed-missing file (403/404) is -- as its own bounded negative, not the
-general failure path.
+positively-confirmed-missing file (404 only, not 403 -- see above) is, as
+its own bounded negative, never the general failure path.
 
 Separately, `/__health` is its own dedicated, TTL-0 endpoint: it never
 reads or writes either cache table, and performs one bounded, unretried,
@@ -145,11 +152,18 @@ class RangeCache:
         self.db_path = db_path
         self.max_bytes = max_bytes
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        # `CREATE TABLE IF NOT EXISTS` only creates the table on a brand-new
+        # database -- it does NOT add a column to a `ranges` table a prior
+        # version of this proxy already created on disk (review 55796's
+        # showstopper). Create-if-absent, then migrate-if-needed, so a
+        # restart-persistent cache from before `complete` existed keeps
+        # working instead of raising "no such column" on the next read/write.
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS ranges (
                  path TEXT NOT NULL,
                  start INTEGER NOT NULL,
                  end INTEGER NOT NULL,
+                 complete INTEGER NOT NULL DEFAULT 0,
                  etag TEXT NOT NULL,
                  body BLOB NOT NULL,
                  size INTEGER NOT NULL,
@@ -164,6 +178,15 @@ class RangeCache:
                  marked_at REAL NOT NULL
                )"""
         )
+        existing_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(ranges)")}
+        if "complete" not in existing_columns:
+            # A pre-existing on-disk `ranges` table from before this column
+            # existed: every legacy row was written before open-ended
+            # fetches were ever validated against the file's true end, so
+            # none of them can be trusted as "complete" -- the conservative,
+            # correct default (0) is exactly what ADD COLUMN ... DEFAULT 0
+            # backfills onto every existing row automatically.
+            self._conn.execute("ALTER TABLE ranges ADD COLUMN complete INTEGER NOT NULL DEFAULT 0")
         self._conn.commit()
         self._db_lock = threading.Lock()
 
@@ -182,14 +205,42 @@ class RangeCache:
             self._conn.commit()
         return row[0], row[1]
 
-    def put_range(self, path: str, start: int, end: int, body: bytes) -> str:
+    def get_range_from(self, path: str, start: int) -> tuple[int, str, bytes] | None:
+        """Looks up a cached range by its start alone, for an open-ended
+        request (no fixed end to key on). Returns (end, etag, body), or None
+        on a miss. Only ever considers a row explicitly marked `complete`
+        (review 55790's showstopper): an ordinary BOUNDED fetch that happens
+        to start at the same offset -- e.g. the TIFF header request at
+        bytes=0-199 -- is cached in this same table but is emphatically NOT
+        "the whole file", and must never be handed back as the answer to a
+        later open-ended/no-Range request just because it shares a start.
+        `complete` is set only by put_range(..., complete=True), which
+        serve_file passes only for an open-ended fetch that
+        fetch_upstream_range has already proven reaches the true end of the
+        representation."""
+        with self._db_lock:
+            row = self._conn.execute(
+                "SELECT end, etag, body FROM ranges WHERE path = ? AND start = ? AND complete = 1 "
+                "ORDER BY end DESC LIMIT 1",
+                (path, start),
+            ).fetchone()
+            if row is None:
+                return None
+            self._conn.execute(
+                "UPDATE ranges SET last_used_at = ? WHERE path = ? AND start = ? AND end = ?",
+                (time.time(), path, start, row[0]),
+            )
+            self._conn.commit()
+        return row[0], row[1], row[2]
+
+    def put_range(self, path: str, start: int, end: int, body: bytes, complete: bool = False) -> str:
         etag = hashlib.sha256(body).hexdigest()
         now = time.time()
         with self._db_lock:
             self._conn.execute(
-                "INSERT OR REPLACE INTO ranges (path, start, end, etag, body, size, created_at, last_used_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (path, start, end, etag, body, len(body), now, now),
+                "INSERT OR REPLACE INTO ranges (path, start, end, complete, etag, body, size, created_at, last_used_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (path, start, end, 1 if complete else 0, etag, body, len(body), now, now),
             )
             self._conn.commit()
         return etag
@@ -261,11 +312,35 @@ class UpstreamError(Exception):
 
 
 class UpstreamMissing(Exception):
-    """Upstream answered 403 or 404: the file genuinely does not exist."""
+    """Upstream answered 404: a positively-confirmed absence. Deliberately
+    NOT raised for 403 -- see the module docstring and Story review
+    checkpoint 55758: an anonymous-bucket 403 cannot be told apart from an
+    auth/provider failure here, so it is never treated as durable absence."""
 
 
 class UpstreamRangeNotSatisfiable(Exception):
     """Upstream answered 416 for this exact range: pass through, never cache."""
+
+
+_CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+|\*)$")
+
+
+def _parse_content_range(header: str | None) -> tuple[int, int, int | None] | None:
+    """Parses a response 'Content-Range: bytes <start>-<end>/<total>' header
+    into (start, end, total) -- total is None for an unknown '*' total --
+    or None if the header is absent/malformed. A malformed or missing
+    Content-Range on a 206 is itself a reason to distrust the response --
+    see the validation in fetch_upstream_range. The total is NOT discarded:
+    for an open-ended request (no explicit end), it is the only way to tell
+    a 206 that happens to reach the true end of the file from one that is
+    silently short (review 55786)."""
+    if not header:
+        return None
+    m = _CONTENT_RANGE_RE.match(header.strip())
+    if not m:
+        return None
+    total = None if m.group(3) == "*" else int(m.group(3))
+    return int(m.group(1)), int(m.group(2)), total
 
 
 def fetch_upstream_range(
@@ -276,16 +351,18 @@ def fetch_upstream_range(
     timeout: float = 10.0,
     retries: int = 3,
 ) -> tuple[bytes, int]:
-    """Fetches one byte range from the allowlisted upstream, matching
-    RangeFiles.transfer(): a fixed Range header is sent, 200 or 206 is
-    success (a 200 body is trimmed to the requested slice when a bounded end
-    was given and the origin ignored Range), 403/404 means the file does not
-    exist (raises UpstreamMissing, never retried), 416 is passed straight
-    through (raises UpstreamRangeNotSatisfiable, never retried, never
-    cached), and anything else is retried with backoff before giving up.
-    Returns (body, actual_end) -- actual_end is the real last byte index
-    covered, which can differ from the requested `end` for an open-ended
-    range.
+    """Fetches one byte range from the allowlisted upstream: a fixed Range
+    header is sent, 200 or 206 is success (a 200 body is trimmed to the
+    requested slice when a bounded end was given and the origin ignored
+    Range), 404 means positively-confirmed absence (raises UpstreamMissing,
+    never retried, cached as a durable negative by the caller), 416 is
+    passed straight through (raises UpstreamRangeNotSatisfiable, never
+    retried, never cached), and anything else -- including 403, which is
+    deliberately NOT treated as confirmed absence here (see UpstreamMissing's
+    docstring) -- is retried with backoff before giving up, and never cached
+    either way. Returns (body, actual_end) -- actual_end is the real last
+    byte index covered, which can differ from the requested `end` for an
+    open-ended range.
     """
     parsed = urllib.parse.urlsplit(upstream_base)
     full_path = parsed.path.rstrip("/") + "/" + file_name
@@ -308,7 +385,23 @@ def fetch_upstream_range(
             resp = conn.getresponse()
             body = resp.read()
             status = resp.status
-            if status in (403, 404):
+            if status == 404:
+                # Per Story review checkpoint 55758: only 404 is treated as
+                # positively-established absence. A 403 from this anonymous,
+                # unsigned S3 bucket is NOT distinguishable here from an
+                # auth/provider failure (a bucket-policy change, a WAF rule,
+                # a throttling response dressed as 403), so it must never
+                # become a durable negative -- it falls through to the
+                # generic retry-then-fail path below instead, exactly like
+                # a 5xx. (RangeFiles.transfer() in the pinned mod source
+                # treats 403 and 404 identically; that in-game behavior is
+                # still a correct description of what the MOD does, but
+                # this proxy cannot independently verify that this specific
+                # bucket's 403 is genuinely absence rather than a stale/
+                # misconfigured permission without a live request, which is
+                # not authorized before terms verification -- so until that
+                # is positively confirmed, the safer, explicitly-requested
+                # behavior is to not persist it.)
                 raise UpstreamMissing(f"HTTP {status} for {full_path}")
             if status == 416:
                 raise UpstreamRangeNotSatisfiable(f"HTTP 416 for {full_path} range {range_value}")
@@ -321,10 +414,59 @@ def fetch_upstream_range(
                     f"truncated transfer for {full_path}: declared {declared}, got {len(body)}"
                 )
                 continue
+            if status == 206:
+                # A 206 MUST carry a Content-Range naming exactly the slice
+                # it is returning. Validate it names our own requested start
+                # (and, for a bounded request, our own requested end) before
+                # trusting the body at all -- a short/mismatched 206 (wrong
+                # Content-Range, or a body shorter than the bytes it claims
+                # to cover) must never be treated as success and must never
+                # reach the cache. This is the exact gap flagged in review
+                # 55784: checking only Content-Length == len(body) proves
+                # the transfer wasn't truncated IN FLIGHT, but says nothing
+                # about whether the origin answered with fewer bytes than
+                # were actually requested.
+                content_range = _parse_content_range(resp.getheader("Content-Range"))
+                if content_range is None:
+                    last_exc = UpstreamError(f"206 with missing/malformed Content-Range for {full_path}")
+                    continue
+                cr_start, cr_end, cr_total = content_range
+                if cr_start != start or len(body) != cr_end - cr_start + 1:
+                    last_exc = UpstreamError(
+                        f"206 Content-Range {cr_start}-{cr_end} does not match body length {len(body)} for {full_path}"
+                    )
+                    continue
+                if end is not None:
+                    if cr_end != end:
+                        last_exc = UpstreamError(
+                            f"206 for {full_path} returned bytes {cr_start}-{cr_end}, requested {start}-{end}"
+                        )
+                        continue
+                else:
+                    # Open-ended request (client sent 'bytes=N-' or no Range
+                    # at all, per serve_file mapping both to end=None): a
+                    # 206 is only complete, cacheable data if it provably
+                    # reaches the true end of the representation -- an
+                    # unknown '*' total, or any cr_end short of total - 1,
+                    # means this could be a silently-truncated partial body
+                    # (review 55786's exact repro) and must be retried, never
+                    # accepted as the whole file.
+                    if cr_total is None or cr_end != cr_total - 1:
+                        last_exc = UpstreamError(
+                            f"open-ended 206 for {full_path} returned bytes {cr_start}-{cr_end}/"
+                            f"{cr_total if cr_total is not None else '*'}, "
+                            "which does not provably reach the end of the file"
+                        )
+                        continue
             if status == 200 and end is not None:
                 length = end - start + 1
                 if start != 0 or len(body) > length:
                     body = body[start:start + length]
+                if len(body) != length:
+                    last_exc = UpstreamError(
+                        f"200 for {full_path} returned only {len(body)} bytes, requested {length}"
+                    )
+                    continue
             actual_end = start + len(body) - 1
             return body, actual_end
         except (UpstreamMissing, UpstreamRangeNotSatisfiable):
@@ -445,8 +587,19 @@ class WorldCoverCacheProxy:
 
         cache_key_end = req_end if req_end is not None else -1  # resolved below on a miss
         cached = None
+        cached_end = req_end
         if req_end is not None:
             cached = self.cache.get_range(file_name, req_start, req_end)
+        else:
+            # Open-ended request: no fixed end to key on, so look up the
+            # longest cached range starting here instead of always treating
+            # it as a miss (a prior open-ended fetch is only ever cached
+            # once fetch_upstream_range has proven it reaches the true end
+            # of the file -- see get_range_from's own docstring).
+            hit = self.cache.get_range_from(file_name, req_start)
+            if hit is not None:
+                cached_end, etag_hit, body_hit = hit
+                cached = (etag_hit, body_hit)
 
         if cached is None:
             def load():
@@ -460,7 +613,13 @@ class WorldCoverCacheProxy:
                 with self.stats.lock:
                     self.stats.upstream_requests += 1
                     self.stats.bytes_downloaded += len(body)
-                etag = self.cache.put_range(file_name, req_start, actual_end, body)
+                # `complete=True` only for an open-ended fetch: fetch_upstream_range
+                # has already proven (via the Content-Range total check) that this
+                # body reaches the true end of the file, so get_range_from may
+                # later serve it for another open-ended/no-Range request. A bounded
+                # fetch (req_end is not None) is never "the whole file" by
+                # definition and must stay complete=False (review 55790).
+                etag = self.cache.put_range(file_name, req_start, actual_end, body, complete=req_end is None)
                 self.cache.evict_to_fit(self.stats)
                 return etag, body, actual_end
 
@@ -479,7 +638,7 @@ class WorldCoverCacheProxy:
             with self.stats.lock:
                 self.stats.cache_hits += 1
             etag, body = cached
-            actual_end = req_end
+            actual_end = cached_end
 
         if if_none_match is not None and if_none_match == etag:
             with self.stats.lock:
