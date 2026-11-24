@@ -17,7 +17,7 @@ verified by a real `git push`).
 ## Run
 
 ```
-python3 -m unittest test_proxy -v   # 28 tests, local mock upstream only
+python3 -m unittest test_proxy -v   # 29 tests, local mock upstream only
 python3 proxy.py                    # serves on 127.0.0.1:8076 by default
 ```
 
@@ -68,6 +68,13 @@ python3 proxy.py                    # serves on 127.0.0.1:8076 by default
   never "the whole file", and must never be handed back as the answer to a
   later open-ended/no-Range request just because it starts at the same
   offset (`test_open_ended_request_never_consumes_a_bounded_row_as_complete`).
+  A restart-persistent cache created by a version of this proxy before the
+  `complete` column existed is migrated in place on open (`ALTER TABLE ...
+  ADD COLUMN complete INTEGER NOT NULL DEFAULT 0`, since `CREATE TABLE IF
+  NOT EXISTS` alone does not add a column to an already-existing table) --
+  every pre-existing row is conservatively treated as incomplete, never a
+  stale "complete" claim (`test_legacy_database_without_complete_column_
+  is_migrated_in_place`, review 55796's showstopper).
 - `404` means "this file does not exist" (open-ocean squares have no file
   at all) and is cached as one durable, restart-persistent negative per
   file (`missing` table), never retried. **`403` is deliberately NOT

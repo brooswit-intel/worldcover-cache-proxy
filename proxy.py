@@ -152,6 +152,12 @@ class RangeCache:
         self.db_path = db_path
         self.max_bytes = max_bytes
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        # `CREATE TABLE IF NOT EXISTS` only creates the table on a brand-new
+        # database -- it does NOT add a column to a `ranges` table a prior
+        # version of this proxy already created on disk (review 55796's
+        # showstopper). Create-if-absent, then migrate-if-needed, so a
+        # restart-persistent cache from before `complete` existed keeps
+        # working instead of raising "no such column" on the next read/write.
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS ranges (
                  path TEXT NOT NULL,
@@ -172,6 +178,15 @@ class RangeCache:
                  marked_at REAL NOT NULL
                )"""
         )
+        existing_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(ranges)")}
+        if "complete" not in existing_columns:
+            # A pre-existing on-disk `ranges` table from before this column
+            # existed: every legacy row was written before open-ended
+            # fetches were ever validated against the file's true end, so
+            # none of them can be trusted as "complete" -- the conservative,
+            # correct default (0) is exactly what ADD COLUMN ... DEFAULT 0
+            # backfills onto every existing row automatically.
+            self._conn.execute("ALTER TABLE ranges ADD COLUMN complete INTEGER NOT NULL DEFAULT 0")
         self._conn.commit()
         self._db_lock = threading.Lock()
 

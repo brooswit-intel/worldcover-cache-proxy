@@ -11,6 +11,7 @@ the real ones the proxy will use against the live default.
 """
 import os
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
@@ -436,6 +437,60 @@ class ProxyIntegrationTest(unittest.TestCase):
         self.assertEqual(status2, 200)
         self.assertEqual(body2, full)
         proxy.close()
+
+    def test_legacy_database_without_complete_column_is_migrated_in_place(self):
+        """Review 55796's showstopper: `CREATE TABLE IF NOT EXISTS` does not
+        add a column to a `ranges` table a prior version of this proxy
+        already created on disk. Builds that exact pre-`complete` schema by
+        hand, seeds a bounded row the old way, then proves opening it with
+        the current code migrates it losslessly: the legacy row stays
+        usable, cannot satisfy an open-ended lookup (conservatively treated
+        as incomplete, never a stale true), new writes work, and the
+        migration itself survives a restart."""
+        legacy_conn = sqlite3.connect(self.db_path)
+        legacy_conn.execute(
+            """CREATE TABLE ranges (
+                 path TEXT NOT NULL,
+                 start INTEGER NOT NULL,
+                 end INTEGER NOT NULL,
+                 etag TEXT NOT NULL,
+                 body BLOB NOT NULL,
+                 size INTEGER NOT NULL,
+                 created_at REAL NOT NULL,
+                 last_used_at REAL NOT NULL,
+                 PRIMARY KEY (path, start, end)
+               )"""
+        )
+        legacy_conn.execute(
+            "INSERT INTO ranges (path, start, end, etag, body, size, created_at, last_used_at) "
+            "VALUES (?, 0, 199, 'legacy-etag', ?, ?, 0, 0)",
+            (EXISTING_FILE, HEADER_BYTES, len(HEADER_BYTES)),
+        )
+        legacy_conn.commit()
+        legacy_conn.close()
+
+        proxy = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)
+        columns = {row[1] for row in proxy.cache._conn.execute("PRAGMA table_info(ranges)")}
+        self.assertIn("complete", columns, "the column must be added to the existing table")
+
+        # The legacy row stays usable for its own exact bounded extent.
+        self.assertEqual(proxy.cache.get_range(EXISTING_FILE, 0, 199), ("legacy-etag", HEADER_BYTES))
+
+        # It must NOT be treated as a complete/whole-file row (conservative
+        # default, never a stale incorrect "complete" claim).
+        self.assertIsNone(proxy.cache.get_range_from(EXISTING_FILE, 0))
+        status, _, body = proxy.serve_file(f"/{EXISTING_FILE}", None, "bytes=0-")
+        self.assertEqual(MockUpstream.hit_count["n"], 1, "open-ended must fetch fresh, not trust the legacy row")
+
+        # New writes work normally post-migration.
+        proxy.cache.put_range(EXISTING_FILE, BLOCK_START, BLOCK_START + len(BLOCK_BYTES) - 1, BLOCK_BYTES)
+        self.assertIsNotNone(proxy.cache.get_range(EXISTING_FILE, BLOCK_START, BLOCK_START + len(BLOCK_BYTES) - 1))
+        proxy.close()
+
+        # The migration itself is persistent -- a fresh open doesn't re-raise.
+        proxy2 = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)
+        self.assertEqual(proxy2.cache.get_range(EXISTING_FILE, 0, 199), ("legacy-etag", HEADER_BYTES))
+        proxy2.close()
 
     def test_conditional_304_on_matching_etag(self):
         proxy = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)
