@@ -157,6 +157,7 @@ class RangeCache:
                  path TEXT NOT NULL,
                  start INTEGER NOT NULL,
                  end INTEGER NOT NULL,
+                 complete INTEGER NOT NULL DEFAULT 0,
                  etag TEXT NOT NULL,
                  body BLOB NOT NULL,
                  size INTEGER NOT NULL,
@@ -191,15 +192,21 @@ class RangeCache:
 
     def get_range_from(self, path: str, start: int) -> tuple[int, str, bytes] | None:
         """Looks up a cached range by its start alone, for an open-ended
-        request (no fixed end to key on). Returns (end, etag, body) for the
-        longest cached range starting there, or None on a miss. Safe because
-        an open-ended fetch is only ever cached (by fetch_upstream_range's
-        own validation) once it has provably reached the true end of the
-        file -- there is at most one genuine "whole remainder" entry per
-        start, never a shorter one masking it."""
+        request (no fixed end to key on). Returns (end, etag, body), or None
+        on a miss. Only ever considers a row explicitly marked `complete`
+        (review 55790's showstopper): an ordinary BOUNDED fetch that happens
+        to start at the same offset -- e.g. the TIFF header request at
+        bytes=0-199 -- is cached in this same table but is emphatically NOT
+        "the whole file", and must never be handed back as the answer to a
+        later open-ended/no-Range request just because it shares a start.
+        `complete` is set only by put_range(..., complete=True), which
+        serve_file passes only for an open-ended fetch that
+        fetch_upstream_range has already proven reaches the true end of the
+        representation."""
         with self._db_lock:
             row = self._conn.execute(
-                "SELECT end, etag, body FROM ranges WHERE path = ? AND start = ? ORDER BY end DESC LIMIT 1",
+                "SELECT end, etag, body FROM ranges WHERE path = ? AND start = ? AND complete = 1 "
+                "ORDER BY end DESC LIMIT 1",
                 (path, start),
             ).fetchone()
             if row is None:
@@ -211,14 +218,14 @@ class RangeCache:
             self._conn.commit()
         return row[0], row[1], row[2]
 
-    def put_range(self, path: str, start: int, end: int, body: bytes) -> str:
+    def put_range(self, path: str, start: int, end: int, body: bytes, complete: bool = False) -> str:
         etag = hashlib.sha256(body).hexdigest()
         now = time.time()
         with self._db_lock:
             self._conn.execute(
-                "INSERT OR REPLACE INTO ranges (path, start, end, etag, body, size, created_at, last_used_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (path, start, end, etag, body, len(body), now, now),
+                "INSERT OR REPLACE INTO ranges (path, start, end, complete, etag, body, size, created_at, last_used_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (path, start, end, 1 if complete else 0, etag, body, len(body), now, now),
             )
             self._conn.commit()
         return etag
@@ -591,7 +598,13 @@ class WorldCoverCacheProxy:
                 with self.stats.lock:
                     self.stats.upstream_requests += 1
                     self.stats.bytes_downloaded += len(body)
-                etag = self.cache.put_range(file_name, req_start, actual_end, body)
+                # `complete=True` only for an open-ended fetch: fetch_upstream_range
+                # has already proven (via the Content-Range total check) that this
+                # body reaches the true end of the file, so get_range_from may
+                # later serve it for another open-ended/no-Range request. A bounded
+                # fetch (req_end is not None) is never "the whole file" by
+                # definition and must stay complete=False (review 55790).
+                etag = self.cache.put_range(file_name, req_start, actual_end, body, complete=req_end is None)
                 self.cache.evict_to_fit(self.stats)
                 return etag, body, actual_end
 

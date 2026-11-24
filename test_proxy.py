@@ -110,8 +110,21 @@ class MockUpstream(BaseHTTPRequestHandler):
             # Positive control: an open-ended 206 that DOES provably reach
             # the end of the representation (cr_end == total - 1) must still
             # be accepted and cached -- the fix must not reject every
-            # open-ended response, only genuinely incomplete ones.
+            # open-ended response, only genuinely incomplete ones. Also
+            # answers an ordinary BOUNDED sub-range (bytes=0-199, like the
+            # TIFF header request) so a test can seed a ``complete=False``
+            # row at the same start before exercising the open-ended path
+            # (review 55790's exact ordering repro).
             full = HEADER_BYTES + BLOCK_BYTES  # 700 bytes total
+            start, end = self._range() or (0, None)
+            if end is not None:
+                body = full[start:end + 1]
+                self.send_response(206)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(full)}")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             self.send_response(206)
             self.send_header("Content-Length", str(len(full)))
             self.send_header("Content-Range", f"bytes 0-{len(full) - 1}/{len(full)}")
@@ -388,6 +401,40 @@ class ProxyIntegrationTest(unittest.TestCase):
         self.assertEqual(status2, 206)
         self.assertEqual(body2, full)
         self.assertEqual(MockUpstream.hit_count["n"], hits_before, "a genuinely complete open-ended response must warm-cache normally")
+        proxy.close()
+
+    def test_open_ended_request_never_consumes_a_bounded_row_as_complete(self):
+        """Review 55790's showstopper, reproduced exactly: a bounded fetch
+        (e.g. the TIFF header request, bytes=0-199) caches a row starting at
+        the same offset an open-ended/no-Range request would also look up.
+        That row must never be treated as "the whole file" -- only a row
+        explicitly proven complete (via a validated open-ended fetch) may
+        satisfy bytes=N- or no-Range."""
+        file_name = "ESA_WorldCover_10m_2021_v200_S04E174_Map.tif"
+        full = HEADER_BYTES + BLOCK_BYTES
+        proxy = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)
+
+        # Seed an ordinary bounded row at start=0 -- NOT the whole file.
+        status0, _, body0 = proxy.serve_file(f"/{file_name}", None, "bytes=0-199")
+        self.assertEqual(status0, 206)
+        self.assertEqual(body0, HEADER_BYTES)
+        self.assertEqual(MockUpstream.hit_count["n"], 1)
+        self.assertIsNone(
+            proxy.cache.get_range_from(file_name, 0),
+            "a bounded row must never be visible to the open-ended/start-only lookup",
+        )
+
+        # bytes=0- must NOT be satisfied by that 200-byte bounded row --
+        # it must go to upstream and get the real, complete 700-byte file.
+        status1, _, body1 = proxy.serve_file(f"/{file_name}", None, "bytes=0-")
+        self.assertEqual(status1, 206)
+        self.assertEqual(body1, full, "must fetch the real whole file, not reuse the bounded row")
+        self.assertEqual(MockUpstream.hit_count["n"], 2, "open-ended must trigger a fresh upstream fetch")
+
+        # no-Range must get the same protection.
+        status2, _, body2 = proxy.serve_file(f"/{file_name}", None, None)
+        self.assertEqual(status2, 200)
+        self.assertEqual(body2, full)
         proxy.close()
 
     def test_conditional_304_on_matching_etag(self):

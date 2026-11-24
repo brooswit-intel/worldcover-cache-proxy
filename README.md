@@ -17,7 +17,7 @@ verified by a real `git push`).
 ## Run
 
 ```
-python3 -m unittest test_proxy -v   # 27 tests, local mock upstream only
+python3 -m unittest test_proxy -v   # 28 tests, local mock upstream only
 python3 proxy.py                    # serves on 127.0.0.1:8076 by default
 ```
 
@@ -61,7 +61,13 @@ python3 proxy.py                    # serves on 127.0.0.1:8076 by default
   `test_open_ended_range_that_reaches_total_is_accepted_and_cached` as the
   positive control). A genuinely-complete open-ended fetch is cached and
   warm-hit on the next request via `RangeCache.get_range_from`, which looks
-  up by start alone since there is no fixed end to key on.
+  up by start alone since there is no fixed end to key on -- **and only
+  ever considers a row explicitly marked `complete`** (review 55790's
+  showstopper): an ordinary bounded fetch sharing the same start (e.g. the
+  TIFF header request at bytes=0-199) is cached in the same table but is
+  never "the whole file", and must never be handed back as the answer to a
+  later open-ended/no-Range request just because it starts at the same
+  offset (`test_open_ended_request_never_consumes_a_bounded_row_as_complete`).
 - `404` means "this file does not exist" (open-ocean squares have no file
   at all) and is cached as one durable, restart-persistent negative per
   file (`missing` table), never retried. **`403` is deliberately NOT
