@@ -278,6 +278,22 @@ class UpstreamRangeNotSatisfiable(Exception):
     """Upstream answered 416 for this exact range: pass through, never cache."""
 
 
+_CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+|\*)$")
+
+
+def _parse_content_range(header: str | None) -> tuple[int, int] | None:
+    """Parses a response 'Content-Range: bytes <start>-<end>/<total>' header
+    into (start, end), or None if absent/malformed. A malformed or missing
+    Content-Range on a 206 is itself a reason to distrust the response --
+    see the validation in fetch_upstream_range."""
+    if not header:
+        return None
+    m = _CONTENT_RANGE_RE.match(header.strip())
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
 def fetch_upstream_range(
     upstream_base: str,
     file_name: str,
@@ -349,10 +365,42 @@ def fetch_upstream_range(
                     f"truncated transfer for {full_path}: declared {declared}, got {len(body)}"
                 )
                 continue
+            if status == 206:
+                # A 206 MUST carry a Content-Range naming exactly the slice
+                # it is returning. Validate it names our own requested start
+                # (and, for a bounded request, our own requested end) before
+                # trusting the body at all -- a short/mismatched 206 (wrong
+                # Content-Range, or a body shorter than the bytes it claims
+                # to cover) must never be treated as success and must never
+                # reach the cache. This is the exact gap flagged in review
+                # 55784: checking only Content-Length == len(body) proves
+                # the transfer wasn't truncated IN FLIGHT, but says nothing
+                # about whether the origin answered with fewer bytes than
+                # were actually requested.
+                content_range = _parse_content_range(resp.getheader("Content-Range"))
+                if content_range is None:
+                    last_exc = UpstreamError(f"206 with missing/malformed Content-Range for {full_path}")
+                    continue
+                cr_start, cr_end = content_range
+                if cr_start != start or len(body) != cr_end - cr_start + 1:
+                    last_exc = UpstreamError(
+                        f"206 Content-Range {cr_start}-{cr_end} does not match body length {len(body)} for {full_path}"
+                    )
+                    continue
+                if end is not None and cr_end != end:
+                    last_exc = UpstreamError(
+                        f"206 for {full_path} returned bytes {cr_start}-{cr_end}, requested {start}-{end}"
+                    )
+                    continue
             if status == 200 and end is not None:
                 length = end - start + 1
                 if start != 0 or len(body) > length:
                     body = body[start:start + length]
+                if len(body) != length:
+                    last_exc = UpstreamError(
+                        f"200 for {full_path} returned only {len(body)} bytes, requested {length}"
+                    )
+                    continue
             actual_end = start + len(body) - 1
             return body, actual_end
         except (UpstreamMissing, UpstreamRangeNotSatisfiable):

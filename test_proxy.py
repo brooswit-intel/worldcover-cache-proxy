@@ -83,6 +83,17 @@ class MockUpstream(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(HEADER_BYTES)
             return
+        if path == "ESA_WorldCover_10m_2021_v200_S02E172_Map.tif":
+            # Review 55784's exact repro: requested bytes=0-199, but the
+            # origin answers 206 with Content-Length 100, Content-Range
+            # "bytes 0-99/1000", and only 100 bytes -- a short/mismatched
+            # 206 that must never be cached as a successful 200-byte range.
+            self.send_response(206)
+            self.send_header("Content-Length", "100")
+            self.send_header("Content-Range", "bytes 0-99/1000")
+            self.end_headers()
+            self.wfile.write(HEADER_BYTES[:100])
+            return
         if path == DEFAULT_HEALTH_FILE:
             # The health probe only cares that *some* HTTP response came back.
             self.send_response(206)
@@ -277,6 +288,31 @@ class ProxyIntegrationTest(unittest.TestCase):
         self.assertEqual(status, 416)
         self.assertIsNone(proxy.cache.get_range(EXISTING_FILE, 500000, 500099))
         proxy.close()
+
+    def test_short_mismatched_206_is_never_cached_as_success(self):
+        """Review 55784's showstopper, reproduced exactly: a 206 whose
+        Content-Range/body cover fewer bytes than were requested must be
+        treated as a retryable upstream failure -- never a cache write --
+        so a truncated COG read can never be served back as if complete."""
+        file_name = "ESA_WorldCover_10m_2021_v200_S02E172_Map.tif"
+        proxy = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)
+        status, _, _ = proxy.serve_file(f"/{file_name}", None, "bytes=0-199")
+        self.assertEqual(status, 502, "a short/mismatched 206 must surface as a failure, not be accepted")
+        self.assertEqual(MockUpstream.hit_count["n"], 3, "must be retried like any other malformed response")
+        self.assertIsNone(proxy.cache.get_range(file_name, 0, 199), "the short response must never be cached")
+        self.assertIsNone(proxy.cache.get_range(file_name, 0, 99), "nor cached under its own (wrong) extent")
+        proxy.close()
+
+        # Restart-regression proof, matching what the reviewer asked for:
+        # no range row for this file survives, so the next request still
+        # goes to upstream rather than serving a previously-smuggled-in
+        # truncated body.
+        proxy2 = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)
+        self.assertIsNone(proxy2.cache.get_range(file_name, 0, 199))
+        status2, _, _ = proxy2.serve_file(f"/{file_name}", None, "bytes=0-199")
+        self.assertEqual(status2, 502)
+        self.assertEqual(MockUpstream.hit_count["n"], 6, "a fresh request after restart must still hit upstream")
+        proxy2.close()
 
     def test_conditional_304_on_matching_etag(self):
         proxy = WorldCoverCacheProxy(self.db_path, upstream_base=self.upstream_base)

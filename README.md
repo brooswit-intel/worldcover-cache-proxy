@@ -17,7 +17,7 @@ verified by a real `git push`).
 ## Run
 
 ```
-python3 -m unittest test_proxy -v   # 23 tests, local mock upstream only
+python3 -m unittest test_proxy -v   # 24 tests, local mock upstream only
 python3 proxy.py                    # serves on 127.0.0.1:8076 by default
 ```
 
@@ -41,7 +41,14 @@ python3 proxy.py                    # serves on 127.0.0.1:8076 by default
 - `200` or `206` from upstream is success (a `200` body is trimmed to the
   requested slice itself, for an origin that ignores Range); the proxy
   always answers the client `206` with the corresponding `Content-Range`
-  for a Range request.
+  for a Range request. **A `206` is only trusted if its `Content-Range`
+  names exactly the requested start (and, for a bounded request, the
+  requested end) and the body length matches that range** -- a short or
+  mismatched `206` (review 55784's showstopper: e.g. `Content-Range bytes
+  0-99/1000` with only 100 bytes when 200 were requested) is treated as a
+  retryable upstream failure and is never cached, never served, under any
+  circumstance (`test_short_mismatched_206_is_never_cached_as_success`,
+  including a restart-regression check that no range row survives it).
 - `404` means "this file does not exist" (open-ocean squares have no file
   at all) and is cached as one durable, restart-persistent negative per
   file (`missing` table), never retried. **`403` is deliberately NOT
